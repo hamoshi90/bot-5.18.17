@@ -1,0 +1,23 @@
+# [NEW 17] خدمة systemd — انسخها إلى /etc/systemd/system/bot.service
+[Unit]
+Description=Telegram Finance Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# عدّل المسار والمستخدم حسب سيرفرك
+User=botuser
+WorkingDirectory=/opt/finance-bot
+EnvironmentFile=/opt/finance-bot/.env
+ExecStart=/opt/finance-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+# تشغيل آمن
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

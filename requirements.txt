@@ -1,0 +1,26 @@
+# المكتبات الأساسية
+aiogram>=3.15
+aiosqlite>=0.20
+python-dotenv>=1.0
+
+# التشفير وكلمات المرور [NEW 20]
+cryptography>=42.0
+
+# الإيصالات PDF [NEW 32]
+fpdf2>=2.7
+
+# الرسم البياني [NEW 34]
+matplotlib>=3.8
+
+# رموز QR لربط شام كاش [R6-PLUS14]
+qrcode[pil]>=7.4
+
+# Web API + Mini App (اختياري) [NEW 14/15]
+fastapi>=0.110
+uvicorn>=0.29
+
+# بروكسي صادر SOCKS5/HTTP [PROXY-OUT]
+aiohttp-socks>=0.8
+
+# لترحيل PostgreSQL (اختياري) [NEW 18]
+# psycopg[binary]>=3.1

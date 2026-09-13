@@ -9,13 +9,6 @@
     POST /global/api/Player/registerPlayer
     POST /global/api/Player/depositToPlayer       {amount, comment, playerId, currencyCode}
     POST /global/api/Player/withdrawFromPlayer    (النموذج نفسه)
-
-الجلسة كوكيز (Set-Cookie) — يديرها aiohttp.CookieJar تلقائياً.
-بيانات الدخول من البيئة:
-    BETS55_PANEL_URL  (افتراضي https://agents.55bets.net)
-    BETS55_AGENT_USER
-    BETS55_AGENT_PASS
-    BETS55_CURRENCY   (افتراضي NSP)
 """
 
 import os
@@ -24,6 +17,7 @@ import asyncio
 import logging
 import secrets
 from datetime import datetime, timezone
+from typing import Optional
 
 try:
     import aiohttp
@@ -53,11 +47,9 @@ class PanelAuthError(PanelError):
 
 
 def panel_config() -> dict:
-    """قراءة إعدادات اللوحة من البيئة (بلا استثناء)."""
+    """قراءة إعدادات اللوحة من البيئة."""
     return {
-        "base": (os.getenv("BETS55_PANEL_URL") or DEFAULT_PANEL_URL)
-        .strip()
-        .rstrip("/"),
+        "base": (os.getenv("BETS55_PANEL_URL") or DEFAULT_PANEL_URL).strip().rstrip("/"),
         "user": (os.getenv("BETS55_AGENT_USER") or "").strip(),
         "pass": (os.getenv("BETS55_AGENT_PASS") or "").strip(),
         "currency": (os.getenv("BETS55_CURRENCY") or "NSP").strip(),
@@ -70,40 +62,41 @@ def panel_configured() -> bool:
     return bool(c["user"] and c["pass"])
 
 
-def parse_wallet(raw: str) -> float:
-    """تحويل «NSP 20892.50» إلى 20892.5."""
-    m = re.search(r"(-?\d[\d,]*(?:\.\d+)?)", str(raw or ""))
-
+def parse_wallet(raw) -> float:
+    """تحويل «NSP 20892.50» أو الأرقام المباشرة إلى float."""
+    if raw is None:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    m = re.search(r"(-?\d[\d,]*(?:\.\d+)?)", str(raw))
     if not m:
         return 0.0
-
-    return float(m.group(1).replace(",", ""))
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0.0
 
 
 # [R6-PLUS13] حالة آخر تواصل مع اللوحة — تظهر في /ops
 PANEL_STATE = {
-    "last_ok": "",       # آخر تواصل ناجح (ISO)
-    "last_error": "",    # آخر خطأ (نص مختصر)
+    "last_ok": "",
+    "last_error": "",
     "last_error_at": "",
-    "wallet": None,      # آخر رصيد محفظة معروف
+    "wallet": None,
     "available": None,
     "currency": "",
-    "players": None,     # آخر عدد لاعبين معروف
+    "players": None,
 }
 
 
 def panel_state() -> dict:
-    """نسخة من حالة اللوحة للعرض."""
     return dict(PANEL_STATE)
 
 
 def _state_note_ok(**kw):
-    PANEL_STATE["last_ok"] = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M",
-    )
+    PANEL_STATE["last_ok"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     PANEL_STATE["last_error"] = ""
     PANEL_STATE["last_error_at"] = ""
-
     for k, v in kw.items():
         if v is not None:
             PANEL_STATE[k] = v
@@ -111,35 +104,35 @@ def _state_note_ok(**kw):
 
 def _state_note_err(err: str):
     PANEL_STATE["last_error"] = str(err)[:120]
-    PANEL_STATE["last_error_at"] = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M",
-    )
+    PANEL_STATE["last_error_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
 class PanelClient:
-    """عميل لوحة الوكيل — جلسة واحدة مع إعادة دخول تلقائي."""
+    """عميل لوحة الوكيل — جلسة موحدة مع إعادة مصادقة تلقائية وحماية من تعارض الحلقات."""
 
     def __init__(self, config: dict = None):
         self.cfg = config or panel_config()
-        self._sess: "aiohttp.ClientSession | None" = None
+        self._sess: Optional["aiohttp.ClientSession"] = None
         self._logged = False
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """تهيئة القفل بكسل لتفادي ربطه بحلقة أحداث غير مفعلة."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def close(self):
         if self._sess and not self._sess.closed:
             await self._sess.close()
-
         self._sess = None
         self._logged = False
-
-    # ---------------- أساسيات ----------------
 
     def _api(self, path: str) -> str:
         return f"{self.cfg['base']}/global/api/{path}"
 
     @staticmethod
     def _headers() -> dict:
-        """هيدرز شبيهة بالمتصفح — بعض جدران الحماية ترفض عملاء المكتبات."""
         return {
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json",
@@ -148,24 +141,18 @@ class PanelClient:
         }
 
     @staticmethod
-    def _proxy_url() -> str | None:
-        """[PROXY-OUT] بروكسي صادر اختياري (env فقط — بلا ملفات)."""
-        p = (os.getenv("BETS55_PROXY")
-             or os.getenv("OUTBOUND_PROXY") or "").strip()
+    def _proxy_url() -> Optional[str]:
+        p = (os.getenv("BETS55_PROXY") or os.getenv("OUTBOUND_PROXY") or "").strip()
         return p or None
 
     def _new_session(self) -> "aiohttp.ClientSession":
-        """جلسة جديدة عبر البروكسي إن ضُبط (socks5 عبر connector)."""
         timeout = aiohttp.ClientTimeout(total=30)
         proxy = self._proxy_url()
         connector = None
 
         if proxy and proxy.lower().startswith("socks"):
             if aiohttp_socks is None:
-                raise PanelError(
-                    "لدعم SOCKS5 ثبّت: pip install aiohttp-socks",
-                )
-
+                raise PanelError("لدعم SOCKS5 ثبّت: pip install aiohttp-socks")
             connector = aiohttp_socks.ProxyConnector.from_url(proxy)
 
         return aiohttp.ClientSession(
@@ -185,7 +172,6 @@ class PanelClient:
         return h
 
     async def _request(self, method: str, path: str, json_body=None):
-        """طلب واحد — يرمي PanelError عند فشل الشبكة."""
         if aiohttp is None:
             raise PanelError("مكتبة aiohttp غير متوفرة")
 
@@ -197,45 +183,29 @@ class PanelClient:
         proxy = self._proxy_url()
 
         if proxy and proxy.lower().startswith("socks"):
-            proxy = None  # socks يمر عبر connector الجلسة
+            proxy = None
 
         try:
             async with self._sess.request(
-                method, url, json=json_body,
-                headers=headers, proxy=proxy,
+                method, url, json=json_body, headers=headers, proxy=proxy
             ) as resp:
                 text = await resp.text()
 
                 if resp.status in (401, 403):
-                    # تشخيص الحجب: جدار حماية/Cloudflare يرد HTML
                     head = text[:200].lstrip().lower()
-
                     if head.startswith(("<!doctype", "<html")):
-                        logger.warning(
-                            "[panel] HTTP %s من %s — رد HTML "
-                            "(حجب جدار حماية/Cloudflare على هذه الشبكة)",
-                            resp.status, path,
-                        )
                         raise PanelAuthError(
-                            "اللوحة تحجب الوصول من هذه الشبكة "
-                            "(جدار حماية/Cloudflare) — جرب شبكة أخرى/VPN",
+                            "اللوحة تحجب الوصول (جدار حماية/Cloudflare) — راجع الاتصال والبروكسي"
                         )
-
-                    logger.warning(
-                        "[panel] HTTP %s من %s — %s",
-                        resp.status, path, text[:120],
-                    )
-                    raise PanelAuthError(
-                        f"اللوحة رفضت الوصول (HTTP {resp.status})",
-                    )
+                    raise PanelAuthError(f"اللوحة رفضت الوصول (HTTP {resp.status})")
 
                 if resp.status >= 500:
-                    raise PanelError(f"خطأ من اللوحة ({resp.status})")
+                    raise PanelError(f"خطأ من الخادم الداخلي للوحة ({resp.status})")
 
                 try:
                     data = await resp.json(content_type=None)
                 except Exception:
-                    raise PanelError(f"رد غير متوقع ({resp.status})")
+                    raise PanelError(f"رد غير متوقع من اللوحة ({resp.status}): {text[:60]}")
 
                 return resp.status, data
         except asyncio.TimeoutError:
@@ -245,88 +215,70 @@ class PanelClient:
 
     @staticmethod
     def _unwrap(data) -> object:
-        """استخراج result من غلاف {status, result}."""
+        """استخراج result وتفادي الخلط بين النصوص العادية وأخطاء الجلسة."""
         if not isinstance(data, dict):
             raise PanelError("رد غير مفهوم من اللوحة")
 
         if data.get("status") is not True:
             msg = ""
-
             res = data.get("result")
-
             if isinstance(res, dict):
                 msg = str(res.get("message") or "")
-
             if not msg:
                 notif = data.get("notification")
-
-                if isinstance(notif, list) and notif:
-                    first = notif[0]
-
-                    if isinstance(first, dict):
-                        msg = str(first.get("content")
-                                  or first.get("message") or "")
-
+                if isinstance(notif, list) and notif and isinstance(notif[0], dict):
+                    msg = str(notif[0].get("content") or notif[0].get("message") or "")
             raise PanelError(msg or "رفضت اللوحة الطلب")
 
         res = data.get("result")
 
-        # [PANEL-STR] جلسة منتهية قد ترد 200 + نص بدل البيانات —
-        # نرفع استثناء مصادقة ليُعاد الدخول تلقائياً ويُعاد الطلب مرة
+        # التحقق من أن النص ليس صفحة تسجيل دخول أو خطأ صلاحيات قبل رفع PanelAuthError
         if isinstance(res, str):
-            raise PanelAuthError(
-                f"رد غير متوقع من اللوحة ({res[:40] or 'فارغ'})",
-            )
+            res_lower = res.strip().lower()
+            if res_lower.startswith(("<html", "<!doctype")) or any(
+                term in res_lower for term in ("unauthorized", "unauthenticated", "session expired")
+            ):
+                raise PanelAuthError(f"انتهت الجلسة أو ردت اللوحة بصفحة دخول ({res[:40]})")
 
         return res
 
     async def _authed(self, method: str, path: str, json_body=None):
-        """طلب بعد ضمان الدخول — إعادة دخول واحدة عند أي شبهة جلسة.
-
-        [PANEL-STR] يشمل الرفض 401/403 وردّ «نتيجة نصية» — كلاهما
-        يُجرّب بعد تسجيل دخول جديد مرة واحدة ثم يظهر الخطأ بوضوح.
-        """
-        async with self._lock:
+        lock = self._get_lock()
+        async with lock:
             if not self._logged:
                 await self.login()
 
             for attempt in (1, 2):
                 try:
-                    status, data = await self._request(
-                        method, path, json_body,
-                    )
+                    _, data = await self._request(method, path, json_body)
                     result = self._unwrap(data)
                     _state_note_ok()
                     return result
                 except PanelAuthError:
                     if attempt == 2:
-                        _state_note_err("انتهت جلسة اللوحة")
+                        _state_note_err("انتهت جلسة اللوحة وتعذرت استعادتها")
                         raise
-
                     self._logged = False
                     await self.login()
                 except PanelError as exc:
-                    _state_note_err(exc)
+                    _state_note_err(str(exc))
                     raise
 
-        raise PanelError("تعذر التواصل مع اللوحة")  # لا يُصل إليه
-
-    # ---------------- الدخول ----------------
+        raise PanelError("تعذر التواصل مع اللوحة")
 
     async def login(self):
         if not panel_configured():
-            raise PanelNotConfigured(
-                "بيانات لوحة الوكيل غير مضبوطة (BETS55_AGENT_USER/PASS)",
-            )
+            raise PanelNotConfigured("بيانات لوحة الوكيل غير مضبوطة (BETS55_AGENT_USER/PASS)")
 
         try:
             status, data = await self._request(
-                "POST", "User/signIn",
+                "POST",
+                "User/signIn",
                 {"username": self.cfg["user"], "password": self.cfg["pass"]},
             )
         except PanelError as exc:
             self._logged = False
-            _state_note_err(exc)
+            _state_note_err(str(exc))
             raise
 
         if status != 200:
@@ -336,40 +288,30 @@ class PanelClient:
 
         res = data.get("result") if isinstance(data, dict) else None
 
-        # اللوحة الحقيقية تعيد status:true حتى مع بيانات خاطئة
-        # (result=false + notification error) — النجاح هو result فعلي.
-        if data.get("status") is True and res not in (False, None):
+        # فحص بـ is not False لتفادي التداخل المنطقي بين 0 و False في بايثون
+        if data.get("status") is True and res is not False and res is not None:
             self._logged = True
             logger.info("[panel] تم الدخول للوحة الوكيل بنجاح")
             return True
 
         msg = ""
-
         if isinstance(res, dict):
             msg = str(res.get("message") or "")
-
         if not msg:
-            notif = data.get("notification") \
-                if isinstance(data, dict) else None
-
-            if isinstance(notif, list) and notif \
-                    and isinstance(notif[0], dict):
-                msg = str(notif[0].get("content")
-                          or notif[0].get("message") or "")
+            notif = data.get("notification") if isinstance(data, dict) else None
+            if isinstance(notif, list) and notif and isinstance(notif[0], dict):
+                msg = str(notif[0].get("content") or notif[0].get("message") or "")
 
         self._logged = False
-        err = f"بيانات الدخول غير صحيحة ({msg})" if msg \
-            else "بيانات الدخول غير صحيحة — راجع BETS55_AGENT_USER/PASS"
+        err = f"بيانات الدخول غير صحيحة ({msg})" if msg else "بيانات الدخول للوحة غير صحيحة"
         _state_note_err(err)
         raise PanelError(err)
 
     # ---------------- العمليات ----------------
 
     async def agent_info(self) -> dict:
-        """معلومات الوكيل + رصيد محفظته."""
         res = await self._authed("GET", "User/get-current-user-info")
-
-        if not isinstance(res, dict):  # [PANEL-STR] حزام أمان
+        if not isinstance(res, dict):
             raise PanelError("رد معلومات الوكيل غير مفهوم")
 
         wallet = res.get("currentWallet") or ""
@@ -377,8 +319,7 @@ class PanelClient:
         info = {
             "username": res.get("username"),
             "affiliate_id": res.get("affiliateId"),
-            "currency": res.get("mainCurrency")
-            or self.cfg["currency"],
+            "currency": res.get("mainCurrency") or self.cfg["currency"],
             "wallet": parse_wallet(wallet),
             "available": parse_wallet(available),
             "raw_available": str(available),
@@ -391,97 +332,82 @@ class PanelClient:
         return info
 
     async def players(self) -> list:
-        """قائمة لاعبي الوكيل."""
-        res = await self._authed(
-            "POST", "Player/getPlayersForCurrentAgent", {},
-        )
-
+        res = await self._authed("POST", "Player/getPlayersForCurrentAgent", {})
         if isinstance(res, dict):
-            rows = list(res.get("records") or [])
+            rows = list(res.get("records") or res.get("players") or res.get("data") or [])
+        elif isinstance(res, list):
+            rows = res
         else:
-            rows = list(res or [])
+            rows = []
 
         if rows:
             _state_note_ok(players=len(rows))
-
         return rows
 
     async def all_wallets(self) -> list:
-        """[AGENT-FULL] محافظ الوكيل بكل العملات (متاح/رصيد/مكافآت/مجمّد)."""
+        """[AGENT-FULL] استخراج آمن لسجلات المحافظ دون تحويلها لمفاتيح نصية."""
         res = await self._authed("POST", "Agent/getAgentAllWallets", {})
-        return list(res or [])
+        if isinstance(res, dict):
+            return list(res.get("records") or res.get("wallets") or res.get("data") or [])
+        if isinstance(res, list):
+            return res
+        return []
 
     async def last_wallet_tx(self) -> dict:
-        """[AGENT-FULL] آخر حركة على محفظة الوكيل."""
         res = await self._authed("POST", "Agent/getAgentWallet", {})
         return res if isinstance(res, dict) else {}
 
-    async def wallet_transactions(self, page: int = 1,
-                                  limit: int = 10) -> list:
-        """[AGENT-FULL] سجل حركات محفظة الوكيل."""
+    async def wallet_transactions(self, page: int = 1, limit: int = 10) -> list:
         res = await self._authed(
-            "POST", "Agent/getAgentTransactionList",
-            {"page": page, "limit": limit},
+            "POST", "Agent/getAgentTransactionList", {"page": page, "limit": limit}
         )
-
         if isinstance(res, dict):
-            return list(res.get("records") or [])
-
-        return list(res or [])
+            return list(res.get("records") or res.get("data") or [])
+        if isinstance(res, list):
+            return res
+        return []
 
     async def available_currencies(self) -> dict:
-        """[AGENT-FULL] العملات المتاحة لحساب الوكيل."""
-        res = await self._authed(
-            "POST", "Agent/getAgentAvailableCurrencies", {},
-        )
+        res = await self._authed("POST", "Agent/getAgentAvailableCurrencies", {})
         return res if isinstance(res, dict) else {}
 
-    async def find_player(self, username: str) -> dict | None:
-        """بحث لاعب باسمه (مقارنة غير حساسة للحالة)."""
+    async def find_player(self, username: str) -> Optional[dict]:
         q = (username or "").strip().lower()
-
         if not q:
             return None
 
         for p in await self.players():
             if str(p.get("username") or "").lower() == q:
                 return p
-
         return None
 
     async def player_balance(self, player_id) -> float:
-        """رصيد اللاعب الرئيسي."""
-        res = await self._authed(
-            "POST", "Player/getPlayerBalanceById", {"playerId": player_id},
-        )
+        try:
+            pid = int(player_id)
+        except (ValueError, TypeError):
+            pid = player_id
+
+        res = await self._authed("POST", "Player/getPlayerBalanceById", {"playerId": pid})
 
         if isinstance(res, list) and res:
             for entry in res:
-                if entry.get("main"):
+                if isinstance(entry, dict) and entry.get("main"):
                     return float(entry.get("balance") or 0)
-
-            return float(res[0].get("balance") or 0)
+            if isinstance(res[0], dict):
+                return float(res[0].get("balance") or 0)
 
         if isinstance(res, dict):
             return float(res.get("balance") or 0)
 
-        return 0.0
+        try:
+            return float(res or 0.0)
+        except (ValueError, TypeError):
+            return 0.0
 
     async def register_player(
-        self, username: str, password: str,
-        currency: str = None, country_code: str = None,
+        self, username: str, password: str, currency: str = None, country_code: str = None
     ) -> dict:
-        """[PLAYER-CREATE] إنشاء لاعب — الصيغة الحقيقية المؤكدة حياً.
-
-        الخادم يتوقع حرفياً:
-            {"player": {"login", "password", "email", "parentId"}}
-        login بدل userName، بريد فريد إلزامي (يُرفض المكرر)،
-        وparentId = رقم الوكيل فقط (يُجلب من الحساب أو BETS55_PARENT_ID).
-        (currency/country محفوظان للتوافق — الخادم لا يطلبهما)
-        """
-        # بريد عشوائي فريد — المكرر يرفض بـ«Duplicate email»
         email = f"p{secrets.token_hex(5)}@gmail.com"
-
         parent_id = (os.getenv("BETS55_PARENT_ID") or "").strip()
 
         if not parent_id:
@@ -489,39 +415,51 @@ class PanelClient:
             parent_id = str(info.get("affiliate_id") or "")
 
         if not parent_id:
-            raise PanelError(
-                "معرف الوكيل الأب غير معروف — عيّن BETS55_PARENT_ID",
-            )
+            raise PanelError("معرف الوكيل الأب غير معروف — عيّن BETS55_PARENT_ID")
 
-        body = {"player": {
-            "login": username,
-            "password": password,
-            "email": email,
-            "parentId": parent_id,
-        }}
+        body = {
+            "player": {
+                "login": username,
+                "password": password,
+                "email": email,
+                "parentId": parent_id,
+            }
+        }
 
-        await self._authed("POST", "Player/registerPlayer", body)
+        res = await self._authed("POST", "Player/registerPlayer", body)
 
-        # الخادم يعيد result=1 — التأكيد النهائي بجلب اللاعب
-        player = await self.find_player(username)
+        # محاولة البحث مع مهلة قصيرة لضمان المزامنة في قاعدة بيانات اللوحة
+        for _ in range(3):
+            player = await self.find_player(username)
+            if player:
+                return player
+            await asyncio.sleep(0.8)
 
-        if player:
-            return player
+        # إذا أعاد الخادم بيانات اللاعب أو معرّفه مباشرة في الرد
+        if isinstance(res, dict) and (res.get("playerId") or res.get("id")):
+            return {
+                "playerId": res.get("playerId") or res.get("id"),
+                "username": username,
+                "currency": currency or self.cfg["currency"],
+            }
 
-        raise PanelError("أُرسل الطلب لكن لم أستطع تأكيد إنشاء اللاعب")
+        raise PanelError("أُرسل طلب إنشاء اللاعب لكن لم يُؤكد ظهوره في قائمة الوكيل بعد")
 
     async def deposit_to_player(
-        self, player_id, amount: float,
-        comment: str = "", currency: str = None,
+        self, player_id, amount: float, comment: str = "", currency: str = None
     ) -> dict:
-        """تحويل رصيد من محفظة الوكيل إلى اللاعب."""
         if amount <= 0:
             raise PanelError("المبلغ يجب أن يكون أكبر من صفر")
+
+        try:
+            pid = int(player_id)
+        except (ValueError, TypeError):
+            pid = player_id
 
         body = {
             "amount": amount,
             "comment": comment or "bot",
-            "playerId": player_id,
+            "playerId": pid,
             "currencyCode": currency or self.cfg["currency"],
         }
 
@@ -529,17 +467,20 @@ class PanelClient:
         return {"ok": True, "result": res}
 
     async def withdraw_from_player(
-        self, player_id, amount: float,
-        comment: str = "", currency: str = None,
+        self, player_id, amount: float, comment: str = "", currency: str = None
     ) -> dict:
-        """سحب رصيد من اللاعب إلى محفظة الوكيل."""
         if amount <= 0:
             raise PanelError("المبلغ يجب أن يكون أكبر من صفر")
+
+        try:
+            pid = int(player_id)
+        except (ValueError, TypeError):
+            pid = player_id
 
         body = {
             "amount": amount,
             "comment": comment or "bot",
-            "playerId": player_id,
+            "playerId": pid,
             "currencyCode": currency or self.cfg["currency"],
         }
 
@@ -547,14 +488,12 @@ class PanelClient:
         return {"ok": True, "result": res}
 
 
-# عميل مشترك للبوت (يُنشأ عند الحاجة)
-_panel_client: PanelClient | None = None
+# عميل مشترك للبوت
+_panel_client: Optional[PanelClient] = None
 
 
 def get_panel() -> PanelClient:
     global _panel_client
-
     if _panel_client is None:
         _panel_client = PanelClient()
-
     return _panel_client

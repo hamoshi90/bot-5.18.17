@@ -1090,6 +1090,15 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+        # [WD-RELAY 5.18.23] ربط أمر الدفع بطلبه — لتنفيذ تحويل شام
+        # آلياً بعد الاعتماد اليدوي (مسار الترحيل بالدورة الدورية)
+        try:
+            cur.execute(
+                "ALTER TABLE payouts ADD COLUMN request_id INTEGER"
+            )
+        except sqlite3.OperationalError:
+            pass
+
         # [R6-PLUS2] تقييمات السحب
         cur.execute(
             """
@@ -1685,6 +1694,13 @@ async def get_finance_staff_ids() -> list:
     return ids
 
 
+# [DEP-NOTE-EDIT 5.18.23] مراجع إشعارات «طلب جديد» المرسلة للفريق
+# المالي: request_id → (النص الأصلي, [(chat_id, message_id), ...])
+# — لختمها لاحقاً عند الاعتماد الآلي أو انتهاء النافذة بدل بقاء
+# «التحقق الآلي جارٍ الآن» معلقاً إلى الأبد فوق طلب مقفل.
+_FINNOTE_REFS: dict = {}
+
+
 async def notify_finance_staff(
     text: str,
     request_id: int,
@@ -1692,20 +1708,63 @@ async def notify_finance_staff(
 ):
     """[NEW 15] إرسال إشعار مالي مع أزرار المعالجة لكل الفريق المالي."""
     show_card = await feat_on("quick_card")  # [AUDIT2]
+    refs = []  # [DEP-NOTE-EDIT 5.18.23]
 
     for staff_id in await get_finance_staff_ids():
         if staff_id == exclude_id:
             continue
         try:
-            await bot.send_message(
+            m = await bot.send_message(
                 staff_id,
                 text,
                 reply_markup=finance_request_kb(request_id, show_card),
             )
+            refs.append((staff_id, m.message_id))  # [DEP-NOTE-EDIT]
         except Exception as exc:
             logger.warning("تعذر إرسال إشعار مالي إلى %s: %s", staff_id, exc)
 
+    if refs:  # [DEP-NOTE-EDIT 5.18.23]
+        _FINNOTE_REFS[int(request_id)] = (text, refs)
+
+        if len(_FINNOTE_REFS) > 300:
+            for _k in list(_FINNOTE_REFS)[:150]:
+                _FINNOTE_REFS.pop(_k, None)
+
     await mirror(text)  # [ADM3-2] نسخة لغرفة المراقبة
+    return refs
+
+
+async def fin_note_stamp(
+    request_id: int,
+    suffix: str,
+    drop_kb: bool = False,
+):
+    """[DEP-NOTE-EDIT 5.18.23] ختم إشعارات الطلب الأصلية برسالة نهائية.
+
+    drop_kb=True يزيل أزرار المعالجة (لطلب اعتُمد آلياً ولا حاجة
+    لأي إجراء)؛ وإلا تبقى الأزرار كما هي (لطلب بانتظار قرار يدوي).
+    """
+    entry = _FINNOTE_REFS.pop(int(request_id), None)
+
+    if not entry:
+        return
+
+    text, refs = entry
+    show_card = await feat_on("quick_card")
+
+    for chat_id, msg_id in refs:
+        try:
+            await bot.edit_message_text(
+                text + suffix,
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=(
+                    None if drop_kb
+                    else finance_request_kb(int(request_id), show_card)
+                ),
+            )
+        except Exception:
+            pass
 
 
 async def audit(
@@ -2556,11 +2615,12 @@ async def process_finance_request(
                 """
                 INSERT INTO payouts
                 (user_tid, amount, method, destination, status, created_by,
-                 created_at)
-                VALUES (?, ?, 'manual', ?, 'pending', ?, ?)
+                 created_at, request_id)
+                VALUES (?, ?, 'manual', ?, 'pending', ?, ?, ?)
                 """,
                 (telegram_id, round2(float(request["amount"])), _wd_dest,
-                 admin_id, now_iso()),  # [WDFIX] الصافي للمستفيد دائماً
+                 admin_id, now_iso(), request_id),  # [WDFIX] الصافي للمستفيد دائماً
+                # [WD-RELAY 5.18.23] request_id لترحيل التحويل آلياً
             )
             payout_id = cur.lastrowid
 
@@ -4918,6 +4978,14 @@ async def _sham_attempt(request_id: int) -> str:
 
         if not req or req["type"] != "deposit" \
                 or req["status"] != "pending":
+            # [DEP-NOTE-EDIT 5.18.23] الطلب لم يعد معلقاً (عُولج يدوياً
+            # غالباً) — نختم إشعاره الأصلي بدل بقاء «جارٍ الآن» معلقاً
+            await fin_note_stamp(
+                request_id,
+                "\n\n✋ <b>أُوقف التحقق الآلي</b> — الطلب لم يعد معلقاً"
+                " (عُولج يدوياً على الأرجح).",
+                drop_kb=True,
+            )
             return "not_pending"
 
         m = re.search(r"txid=([^;]+)", req["note"] or "")
@@ -5078,6 +5146,15 @@ async def _sham_attempt(request_id: int) -> str:
         except Exception:
             pass
 
+        # [DEP-NOTE-EDIT 5.18.23] ختم إشعار «طلب شحن جديد» الأصلي —
+        # الطلب أُغلق آلياً فلا تبقى ملاحظة «التحقق جارٍ الآن» ولا
+        # أزرار معالجة فوقه
+        await fin_note_stamp(
+            request_id,
+            "\n\n✅ <b>اعتُمد آلياً</b> (شام كاش) — لا حاجة لأي إجراء.",
+            drop_kb=True,
+        )
+
         await _sham_auto_notify(
             f"✅ <b>شحن آلي</b> — طلب #{request_id} | {amt:,.2f} | "
             f"العملية <code>{esc(txid)}</code>",
@@ -5104,6 +5181,13 @@ async def _sham_verify_window(request_id: int):
 
         # [AUTO-FIX 5.18.18] انتهت النافذة بلا مطابقة — إشعار بدل
         # السكوت، حتى يعرف الأدمن أن الآلي حاول وفشل ولماذا يراجع يدوياً
+        # [DEP-NOTE-EDIT 5.18.23] + ختم إشعار الطلب الأصلي بأن النافذة
+        # انتهت (تبقى أزرار المعالجة — القرار اليدوي ما زال مطلوباً)
+        await fin_note_stamp(
+            request_id,
+            "\n\n⏹ <b>انتهت نافذة التحقق الآلي بلا مطابقة</b> —"
+            " القرار اليدوي لك الآن.",
+        )
         await _notify_once(
             f"winend:{request_id}",
             "⌛ <b>انتهت نافذة التحقق الآلي</b> (~25 دقيقة) للطلب "
@@ -5608,6 +5692,18 @@ async def _sham_wd_tick() -> dict:
         return stats
 
     if await get_setting("shamwd_freeze_note"):
+        # [WD-FROST 5.18.23] تنبيه يومي بدل السكوت التام — الأدمن قد
+        # لا يعرف أن السحب الآلي متوقف منذ فحص سابق فتتراكم الطلبات
+        # بلا تحويل ولا رسالة واحدة
+        await _notify_once(
+            f"wdfrz:{datetime.now(timezone.utc):%Y-%m-%d}",
+            "🧊 <b>السحب الآلي مجمد</b> — لا تُنفَّذ أي سحوبات آلية"
+            " (ولا تحويلات الطلبات المعتمدة يدوياً).\n\n"
+            "السبب المسجل:\n"
+            f"<code>{esc((await get_setting('shamwd_freeze_note') or '')[:250])}"
+            "</code>\n\nعالجه ثم أعد التفعيل من:"
+            " الإدارة ← شام كاش ← شاشة السحب الآلي.",
+        )
         return stats  # مجمد بانتظار فحص الأدمن
 
     sess = await _sham_load()
@@ -5832,6 +5928,162 @@ async def _sham_wd_tick() -> dict:
             f"✅ سحب آلي #{req['id']} | {amount:,.2f} ← "
             f"<code>{esc(dest)}</code> | مرجع <code>{esc(ref)}</code>",
         )
+
+    # ── [WD-RELAY 5.18.23] ترحيل الطلبات المعتمدة يدوياً ──
+    # موافقة الأدمن اليدوية على سحب شام كاش تُنشئ أمر دفع معلقاً؛
+    # هنا يُنفَّذ تحويله آلياً (شام كاش فقط) بدل انتظار تحويل يدوي.
+    # أي فشل يجمّد الميزة كلها — نفس فلسفة المسار الآلي الأصلي.
+    if not await get_setting("shamwd_freeze_note"):
+        try:
+            db_r = await get_db()
+
+            try:
+                cur_r = await db_r.execute(
+                    "SELECT p.id AS pid, p.user_tid, p.amount AS pamt,"
+                    " p.destination AS pdest, fr.id AS rid"
+                    " FROM payouts p"
+                    " JOIN finance_requests fr ON fr.id = p.request_id"
+                    " WHERE p.status = 'pending'"
+                    " AND COALESCE(p.external_id, '') = ''"
+                    " AND COALESCE(p.destination, '') != ''"
+                    " AND fr.type = 'withdraw' AND fr.status = 'approved'"
+                    " AND fr.note LIKE '%شام كاش%'"
+                    " AND fr.note NOT LIKE '%wdauto=%'"
+                    " ORDER BY p.id LIMIT 3",
+                )
+                relay_rows = await cur_r.fetchall()
+            finally:
+                await db_r.close()
+        except Exception:
+            logger.exception("[auto-wd] فشل جلب أوامر الدفع للترحيل")
+            relay_rows = []
+
+        for rrow in relay_rows:
+            amount = round2(float(rrow["pamt"]))
+            dest = (rrow["pdest"] or "").strip()
+            u_used2 = used_by_user.get(int(rrow["user_tid"]), 0.0)
+
+            if cap > 0 and round2(used_total + amount) > round2(cap):
+                await _notify_once(
+                    f"relaycap:{rrow['pid']}",
+                    f"🛑 أمر الدفع #{rrow['pid']} (سحب #{rrow['rid']})"
+                    f" معتمد يدوياً ({amount:,.2f}) لكنه يتجاوز السقف"
+                    f" اليومي للسحب الآلي ({used_total:,.2f}/{cap:,.2f})"
+                    " — حوّله يدوياً ثم علّم أمر الدفع مدفوعاً.",
+                )
+                continue
+
+            if ucap > 0 and round2(u_used2 + amount) > round2(ucap):
+                await _notify_once(
+                    f"relayucap:{rrow['pid']}",
+                    f"🛑 أمر الدفع #{rrow['pid']} (سحب #{rrow['rid']})"
+                    f" معتمد يدوياً ({amount:,.2f}) لكنه يتجاوز سقف"
+                    f" المستخدم اليومي ({u_used2:,.2f}/{ucap:,.2f})"
+                    " — حوّله يدوياً ثم علّم أمر الدفع مدفوعاً.",
+                )
+                continue
+
+            # [WD-BREATH] تنفّس بشري قبل/بين التحويلات المتتالية
+            if stats["executed"] > 0 or stats["failed"] > 0:
+                gap = 20 + (secrets.randbelow(41))
+                await _sham_auto_notify(
+                    f"⏳ تنفّس {gap}ث قبل التحويل التالي (إيقاع بشري).",
+                )
+                await asyncio.sleep(gap)
+
+            # وسم أحادي المساس: فشل واحد يتركه للأدمن نهائياً
+            await _wd_mark(int(rrow["rid"]), "relay")
+
+            try:
+                res = await sham.send_transfer(
+                    sess, dest, amount, note=f"WD{rrow['rid']}",
+                )
+            except Exception as exc:
+                await _sham_wd_freeze(
+                    f"فشل إرسال سحب معتمد يدوياً #{rrow['rid']}"
+                    f" (أمر دفع #{rrow['pid']}، {amount:,.2f} ←"
+                    f" {dest}): {exc}. أمر الدفع معلق — نفّذه يدوياً"
+                    " أو علّمه فاشلاً (باسترداد) من إدارة الأوامر.",
+                )
+                break
+
+            if sham.res_failed(res):
+                await _sham_wd_freeze(
+                    f"رفض شام كاش سحباً معتمداً يدوياً #{rrow['rid']}"
+                    f" (أمر دفع #{rrow['pid']}): "
+                    f"{esc(str(res.get('message') or res.get('result') or '?'))}."
+                    "\n📄 <b>الرد الخام</b> (أرسله للأدمن التقني لتصحيح"
+                    " صيغة الإرسال):\n"
+                    f"<code>{esc(str(res)[:400])}</code>"
+                    "\n\nأمر الدفع معلق — عالجه يدوياً.",
+                )
+                break
+
+            ref = sham.tx_ref_from_res(res)
+
+            if not ref:
+                # لا مرجع بالرد → تحقق مستقل من السجل الصادر
+                for _ in range(3):
+                    try:
+                        tx = await sham.find_outgoing(sess, amount, dest)
+                    except Exception:
+                        tx = None
+
+                    if tx:
+                        ref = str(tx.get("strTranId")
+                                  or tx.get("tranId") or "")
+                        break
+
+                    await asyncio.sleep(2)
+
+            if not ref:
+                await _sham_wd_freeze(
+                    f"نتيجة غير مؤكدة لسحب معتمد يدوياً #{rrow['rid']}"
+                    f" (أمر دفع #{rrow['pid']}، {amount:,.2f} ← {dest})"
+                    " — لا مرجع بالإرسال ولا بالسجل."
+                    "\n📄 <b>الرد الخام</b> (أرسله للأدمن التقني):"
+                    f"\n<code>{esc(str(res)[:400])}</code>"
+                    "\n\nتحقق من محفظة شام قبل أي إجراء.",
+                )
+                break
+
+            paid = await mark_payout_paid(
+                int(rrow["pid"]), external_id=f"sham:{ref}",
+                admin_id=ADMIN_USER_ID,
+            )
+
+            if not paid:
+                await _sham_wd_freeze(
+                    f"السحب #{rrow['rid']} (أمر دفع #{rrow['pid']})"
+                    f" أُرسل (مرجع {ref}) لكن تعليم أمر الدفع فشل —"
+                    " راجع الأوامر يدوياً فوراً.",
+                )
+                break
+
+            used_by_user[int(rrow["user_tid"])] = round2(u_used2 + amount)
+            used_total = round2(used_total + amount)
+            stats["executed"] += 1
+            await audit(
+                ADMIN_USER_ID, "sham_auto_wd", f"request={rrow['rid']}",
+                f"ref={ref};amount={amount};dest={dest};relay=1",
+            )
+
+            try:
+                await bot.send_message(
+                    int(rrow["user_tid"]),
+                    "🤖 <b>تم تنفيذ سحبك آلياً</b>\n"
+                    f"الطلب #{rrow['rid']} — <b>{amount:,.2f}</b> إلى\n"
+                    f"<code>{esc(dest)}</code>\n"
+                    f"مرجع شام كاش: <code>{esc(ref)}</code>",
+                )
+            except Exception:
+                pass
+
+            events.append(
+                f"✅ تنفيذ سحب معتمد يدوياً #{rrow['rid']} | "
+                f"{amount:,.2f} ← <code>{esc(dest)}</code> | "
+                f"مرجع <code>{esc(ref)}</code>",
+            )
 
     if events:
         await _sham_auto_notify(
@@ -9441,6 +9693,16 @@ async def finance_approve(cb: types.CallbackQuery, state: FSMContext):
                 f"payout={payout_id}",
                 f"user={request['telegram_id']};amount={gross}",
             )
+
+            # [WD-RELAY 5.18.23] هل سينفّذ البوت التحويل آلياً؟
+            _note = request["note"] or ""
+            _relay = (
+                "شام كاش" in _note
+                and "dest=" in _note
+                and await feat_on("sham_auto_wd")
+                and not await get_setting("shamwd_freeze_note")
+            )
+
             kb_po = InlineKeyboardBuilder()
             kb_po.button(
                 text="✅ مدفوعة",
@@ -9457,8 +9719,18 @@ async def finance_approve(cb: types.CallbackQuery, state: FSMContext):
                     f"🆔 Payout: #{payout_id}\n"
                     f"👤 المستخدم: <code>{request['telegram_id']}</code>\n"
                     f"💵 المبلغ: <b>{money(gross)}</b>\n\n"
-                    "بعد تحويل المبلغ فعلياً اضغط «مدفوعة»،\n"
-                    "أو «فشلت» لإرجاع المبلغ لرصيد المستخدم تلقائياً.",
+                    + (
+                        "🤖 <b>السحب الآلي مفعّل</b> — سيحوّل البوت"
+                        " المبلغ تلقائياً خلال ~دقيقة ويعلّم هذا الأمر"
+                        " «مدفوعة» بنفسه.\nلا تحوّل يدوياً إلا إن وصلتك"
+                        " رسالة فشل أو تجميد.\n\n"
+                        if _relay else
+                        "بعد تحويل المبلغ فعلياً اضغط «مدفوعة»،\n"
+                        "أو «فشلت» لإرجاع المبلغ لرصيد المستخدم"
+                        " تلقائياً.\n\n"
+                    )
+                    + "بعد أي تحويل يدوي: «مدفوعة» — و«فشلت» تُرجع"
+                    " المبلغ لرصيد المستخدم تلقائياً.",
                     reply_markup=kb_po.as_markup(),
                 )
             except Exception as exc:

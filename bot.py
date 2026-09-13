@@ -8446,6 +8446,16 @@ async def withdraw_amount(message: types.Message, state: FSMContext):
 async def _finalize_withdraw(message: types.Message, state: FSMContext,
                              wd_lang: str = "ar"):
     """[R6-PLUS3] إنشاء طلب السحب فعلياً بعد التأكيد."""
+    # [WD-IDFIX 5.18.22] صمام أمان: لا يجوز إنشاء سحب بهوية البوت
+    # نفسه (كان يحدث لتمرير cb.message في wd_ok — from_user هو البوت)
+    if getattr(message.from_user, "id", None) == bot.id:
+        logger.error(
+            "[WD-IDFIX] محاولة إنشاء سحب بهوية البوت نفسها (%s)"
+            " — أُوقفت. راجع مُمرِّر الرسالة.",
+            bot.id,
+        )
+        return
+
     data = await state.get_data()
 
     net = float(data["wdc_net"])
@@ -8604,7 +8614,16 @@ async def wd_ok(cb: types.CallbackQuery, state: FSMContext):
         return
 
     await cb.answer("✅ أُرسل الطلب")
-    await _finalize_withdraw(cb.message, state,
+
+    # [WD-IDFIX 5.18.22] cb.message هو رسالة البوت نفسه — from_user
+    # يعيد البوت لا المستخدم! كان الطلب يُنشأ تحت معرف البوت فيفشل
+    # حجز الرصيد دائماً برسالة «تغيّر رصيدك». نمرر غلافاً يحمل
+    # هوية الضاغط الحقيقية (نفس نمط quick_withdraw).
+    shim = SimpleNamespace(
+        from_user=cb.from_user,
+        answer=cb.message.answer,
+    )
+    await _finalize_withdraw(shim, state,
                              await user_lang(cb.from_user.id))
 
 
@@ -26536,6 +26555,32 @@ async def main(notify_crash: bool = False):
             me = await bot.me()
             BOT_USERNAME = me.username or ""  # [NEW 29]
             logger.info("Bot username: @%s", BOT_USERNAME)
+
+            # [WD-IDFIX 5.18.22] تنظيف طلبات وهمية خلّفها خطأ الهوية
+            # القديم في wd_ok (كان الطلب يُنشأ تحت معرف البوت نفسه
+            # ثم يُلغى فوراً عند فشل حجز الرصيد)
+            try:
+                db_gc = await get_db()
+
+                try:
+                    cur_gc = await db_gc.execute(
+                        "DELETE FROM finance_requests"
+                        " WHERE telegram_id = ? AND type = 'withdraw'",
+                        (me.id,),
+                    )
+
+                    if cur_gc.rowcount:
+                        logger.info(
+                            "[WD-IDFIX] حُذف %d طلب سحب وهمي"
+                            " تحت معرف البوت.",
+                            cur_gc.rowcount,
+                        )
+                finally:
+                    await db_gc.close()
+            except Exception:
+                logger.exception(
+                    "[WD-IDFIX] تنظيف الطلبات الوهمية فشل."
+                )
         except Exception as exc:
             logger.warning("تعذر جلب معلومات البوت: %s", exc)
 

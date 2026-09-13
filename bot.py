@@ -22957,6 +22957,20 @@ async def deposit_txid(message: types.Message, state: FSMContext):
         reply_markup=b_done.as_markup(),
     )
 
+    # [AUTODEP-NOTE 5.18.21] توضيح مسار التحقق الآلي بالإشعار نفسه —
+    # كان الأدمن يعتمد يدوياً «فوراً» فتُجهض نافذة الآلي قبل أن تبدو
+    auto_note = ""
+
+    if (method == "شام كاش"
+            and await feat_on("sham_auto_dep")
+            and await _sham_load()):
+        auto_note = (
+            "\n\n🤖 <b>التحقق الآلي جارٍ الآن</b> (نافذة ~25 دقيقة)"
+            " — إن تطابق رقم العملية والمبلغ سيعتمد الطلب تلقائياً"
+            " خلال ثوانٍ.\n💡 اتركه إن أردت المسار الآلي؛"
+            " اعتمادك اليدوي يوقفه."
+        )
+
     # [NEW 15] إشعار الفريق المالي كاملاً
     await notify_finance_staff(
         "💰 <b>طلب شحن جديد</b>\n\n"
@@ -22964,7 +22978,7 @@ async def deposit_txid(message: types.Message, state: FSMContext):
         f"💳 الطريقة: <b>{esc(method)}</b>\n"
         f"💵 المبلغ: <b>{money(amount)}</b>\n"
         f"🆔 رقم العملية: <code>{esc(txid)}</code>\n"
-        f"🧾 الطلب: #{request_id}",
+        f"🧾 الطلب: #{request_id}" + auto_note,
         request_id,
         exclude_id=message.from_user.id,
     )

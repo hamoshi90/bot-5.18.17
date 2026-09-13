@@ -377,7 +377,11 @@ class PanelClient:
             return None
 
         for p in await self.players():
-            if str(p.get("username") or "").lower() == q:
+            # [PANEL-V2.1] بعض ردود اللوحة تستخدم login/userName بدل
+            # username — البحث بالثلاثة كي لا يُفقد لاعب موجود فعلاً
+            un = str(p.get("username") or p.get("login")
+                     or p.get("userName") or "").strip().lower()
+            if un == q:
                 return p
         return None
 
@@ -429,11 +433,14 @@ class PanelClient:
         res = await self._authed("POST", "Player/registerPlayer", body)
 
         # محاولة البحث مع مهلة قصيرة لضمان المزامنة في قاعدة بيانات اللوحة
-        for _ in range(3):
+        # [PANEL-V2.1] 5 محاولات بفواصل متدرجة (~8 ثوانٍ) — كانت 3×0.8ث
+        # لا تكفي: ملاحظة حية من المالك — اللاعب يظهر باللوحة فعلاً
+        # والبوت يقول «لم يُؤكد ظهوره»
+        for i in range(5):
             player = await self.find_player(username)
             if player:
                 return player
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.5 if i == 0 else 1.5)
 
         # إذا أعاد الخادم بيانات اللاعب أو معرّفه مباشرة في الرد
         if isinstance(res, dict) and (res.get("playerId") or res.get("id")):
@@ -443,7 +450,24 @@ class PanelClient:
                 "currency": currency or self.cfg["currency"],
             }
 
-        raise PanelError("أُرسل طلب إنشاء اللاعب لكن لم يُؤكد ظهوره في قائمة الوكيل بعد")
+        # [PANEL-V2.1] الخادم أكد الاستلام (status:true + result=1) —
+        # الإنشاء نجح غالباً وقائمة الوكيل لم تتزامن بعد: نبلّغ النجاح
+        # بلا معرف بدل خطأ كاذب (سيناريو مؤكد حياً: اللاعب موجود
+        # باللوحة والبوت أظهر «لم يُؤكد ظهوره»)
+        if (isinstance(res, int) and res > 0) or (
+            isinstance(res, str) and res.strip().isdigit()
+        ):
+            return {
+                "playerId": None,
+                "username": username,
+                "currency": currency or self.cfg["currency"],
+                "unconfirmed": True,
+            }
+
+        raise PanelError(
+            "أُرسل طلب إنشاء اللاعب ولم يُرفض، لكن لم يظهر في قائمة"
+            " الوكيل بعد — تأكد منه خلال لحظات من «📋 اللاعبون»"
+        )
 
     async def deposit_to_player(
         self, player_id, amount: float, comment: str = "", currency: str = None

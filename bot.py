@@ -4137,11 +4137,17 @@ async def panel_create_password(message: types.Message, state: FSMContext):
 
     await audit(message.from_user.id, "panel_player_create",
                 details=f"player={username} id={res.get('playerId')}")
+
+    # [PANEL-V2.1] المعرف قد يتأخر بتزامن قائمة اللوحة — رسالة صادقة
+    pid = res.get("playerId")
+    id_line = f" (#{pid})" if pid else ""
+    sync_line = ("\n⏳ أنشئ على الخادم — المعرف سيظهر بقائمة"
+                 " «📋 اللاعبون» خلال لحظات.") if res.get("unconfirmed") else ""
+
     await message.answer(
         "✅ <b>تم إنشاء اللاعب باللوحة</b>\n\n"
-        f"👤 <code>{esc(username)}</code>"
-        f" (#{res.get('playerId')})\n"
-        f"🔑 <code>{esc(password)}</code>",
+        f"👤 <code>{esc(username)}</code>{id_line}\n"
+        f"🔑 <code>{esc(password)}</code>" + sync_line,
     )
 
 

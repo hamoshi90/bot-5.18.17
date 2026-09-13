@@ -3887,8 +3887,7 @@ async def panel_home(cb: types.CallbackQuery, state: FSMContext):
                 w0 = wallets[0]
                 avail = ipanel.parse_wallet(w0.get("availableWallet"))
                 txt += (f"\n💼 متاح للسحب: <b>{avail:,.2f}</b> "
-                        f"{esc(str(w0.get('currencyCode')
-                                or info['currency']))}")
+                        f"{esc(str(w0.get('currencyCode') or info['currency']))}")
 
     kb = InlineKeyboardBuilder()
     kb.button(text="📋 اللاعبون", callback_data="panel_players")
@@ -4146,7 +4145,7 @@ async def panel_create_password(message: types.Message, state: FSMContext):
     )
 
 
-async def _panel_money_start(cb: types.CallbackQuery, kind: str):
+async def _panel_money_start(cb: types.CallbackQuery, state: FSMContext, kind: str):
     if not await is_admin_or_supervisor(cb.from_user.id):
         await cb.answer("غير مصرّح.", show_alert=True)
         return
@@ -4158,13 +4157,13 @@ async def _panel_money_start(cb: types.CallbackQuery, kind: str):
 
 
 @dp.callback_query(F.data == "panel_deposit")
-async def panel_deposit_start(cb: types.CallbackQuery):
-    await _panel_money_start(cb, "deposit")
+async def panel_deposit_start(cb: types.CallbackQuery, state: FSMContext):
+    await _panel_money_start(cb, state, "deposit")
 
 
 @dp.callback_query(F.data == "panel_withdraw")
-async def panel_withdraw_start(cb: types.CallbackQuery):
-    await _panel_money_start(cb, "withdraw")
+async def panel_withdraw_start(cb: types.CallbackQuery, state: FSMContext):
+    await _panel_money_start(cb, state, "withdraw")
 
 
 PANEL_KIND_KEY = f"panel_kind_"
@@ -4378,13 +4377,14 @@ def _sham_home_kb(linked: bool):
 
     if linked:
         kb.button(text="💰 الأرصدة الحية", callback_data="sham_balances")
+        kb.button(text="🧪 فحص وتشخيص", callback_data="sham_diag")
         kb.button(text="🔁 إعادة ربط", callback_data="sham_link_start")
         kb.button(text="🗑 إلغاء الربط", callback_data="sham_unlink")
     else:
         kb.button(text="🔗 ربط حساب الآن", callback_data="sham_link_start")
 
     kb.button(text="🔙 رجوع", callback_data="admin_manage_sham")  # [MENU-ORG]
-    kb.adjust(2, 1, 1)
+    kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -4776,6 +4776,24 @@ def _sham_dep_split(raw: str) -> set:
     return {x.strip() for x in (raw or "").split(",") if x.strip()}
 
 
+def _txid_norm(v) -> str:
+    """[AUTO-FIX 5.18.18] توحيد رقم العملية للمقارنة المرنة.
+
+    يتجاهل الفراغات/الشرطات/الشرط السفلي وحالة الأحرف — فالمستخدم
+    قد ينسخ الرقم بفراغ أو بحروف صغيرة من إشعار شام كاش.
+    """
+    return re.sub(r"[\s\-–—_]", "", str(v or "")).strip().upper()
+
+
+class _ShamRejectedError(Exception):
+    """[AUTO-FIX 5.18.18] رد رفض صريح من خادم شام كاش.
+
+    يميز انتهاء الجلسة/رفض الخادم عن أخطاء الشبكة العابرة: الأول
+    يوقف نافذة التحقق فوراً (لا جدوى من إعادة المحاولة)، والثاني
+    تُعاود نبضة لاحقة محاولتها كالمعتاد.
+    """
+
+
 def _sham_dep_join(items: set) -> str:
     lst = sorted(items)[-SHAM_DEP_KEEP:]
     return ",".join(lst)
@@ -4819,7 +4837,15 @@ async def _sham_fetch_incoming(sess: dict, pages: int = 2) -> list:
         try:
             data = await sham.history(sess, page)
         except Exception:
-            break
+            break  # خطأ عابر (شبكة/مهلة) — تُحاول النبضة التالية
+
+        # [AUTO-FIX 5.18.18] رد رفض صريح (جلسة منتهية غالباً) —
+        # كان يُعالج كأنه سجل فارغ فتموت نافذة التحقق بصمت
+        if isinstance(data, dict) and data.get("succeeded") is False:
+            raise _ShamRejectedError(
+                str(data.get("message") or data.get("result")
+                    or "رفض من خادم شام كاش"),
+            )
 
         batch = []
 
@@ -4836,7 +4862,14 @@ async def _sham_fetch_incoming(sess: dict, pages: int = 2) -> list:
         rows += [tx for tx in batch if isinstance(tx, dict)
                  and str(tx.get("tranKind") or "") == "1"]
 
-        if not (isinstance(data, dict) and data.get("haveNext")):
+        # [AUTO-FIX 5.18.18] تابع الصفحة التالية ما دامت الحالية غير
+        # فارغة — كان الرد القائمة يوقف الترقيم بعد الصفحة الأولى
+        # فتفلت عمليات موجودة بالصفحة 2+
+        if not batch:
+            break
+
+        if isinstance(data, dict) and "haveNext" in data \
+                and not data.get("haveNext"):
             break
 
     return rows
@@ -4854,6 +4887,15 @@ async def _sham_attempt(request_id: int) -> str:
     sess = await _sham_load()
 
     if not sess:
+        # [AUTO-FIX 5.18.18] كان السكوت هنا يدفن فشل الشحن الآلي بلا
+        # أي أثر — إشعار يومي واحد بدل الصمت التام
+        await _notify_once(
+            f"nosess:{datetime.now(timezone.utc):%Y-%m-%d}",
+            "⚠️ <b>الشحن الآلي متوقف فعلياً</b> — جلسة شام كاش غير "
+            "موجودة أو منتهية، فلا يمكن التحقق من أي عملية.\n"
+            "أعد الربط من: الإدارة ← شام كاش ← 🔁 إعادة ربط،"
+            " ثم جرّب الطلب من جديد.",
+        )
         return "no_session"
 
     async with _sham_verify_lock:
@@ -4905,6 +4947,17 @@ async def _sham_attempt(request_id: int) -> str:
 
         try:
             incoming = await _sham_fetch_incoming(sess, 2)
+        except _ShamRejectedError as exc:
+            # [AUTO-FIX 5.18.18] فشل صريح من الخادم (جلسة منتهية غالباً)
+            # — كان يُبلَع كأنه "لا مطابقة" فتُهدر 25 دقيقة بلا سبب
+            await _notify_once(
+                f"histfail:{datetime.now(timezone.utc):%Y-%m-%d}",
+                "⚠️ <b>تعذر قراءة سجل شام كاش</b> أثناء التحقق الآلي:\n"
+                f"<code>{esc(str(exc))}</code>\n\n"
+                "غالباً الجلسة منتهية — أعد الربط من شاشة شام كاش"
+                " ثم أعد المحاولة.",
+            )
+            return "no_session"
         except Exception as exc:
             logger.warning("[evdep] تعذر جلب السجل: %s", exc)
             return "no_match"
@@ -4913,7 +4966,8 @@ async def _sham_attempt(request_id: int) -> str:
         mismatch = False
 
         for tx in incoming:
-            if str(tx.get("strTranId") or "").strip() != txid:
+            # [AUTO-FIX 5.18.18] مقارنة موحدة تتحمل فراغات/شرطات/حالة
+            if _txid_norm(tx.get("strTranId")) != _txid_norm(txid):
                 continue
 
             amt = round2(float(tx.get("amount") or 0))
@@ -5041,6 +5095,18 @@ async def _sham_verify_window(request_id: int):
 
             if st != "no_match":
                 return
+
+        # [AUTO-FIX 5.18.18] انتهت النافذة بلا مطابقة — إشعار بدل
+        # السكوت، حتى يعرف الأدمن أن الآلي حاول وفشل ولماذا يراجع يدوياً
+        await _notify_once(
+            f"winend:{request_id}",
+            "⌛ <b>انتهت نافذة التحقق الآلي</b> (~25 دقيقة) للطلب "
+            f"#{request_id} دون العثور على عملية مطابقة بسجل شام كاش.\n"
+            "الطلب بانتظار المعالجة اليدوية.\n\n"
+            "تأكد من: رقم العملية صحيح، المبلغ المُحوَّل = مبلغ الطلب"
+            " تماماً، وأن التحويل وصل لحساب البوت المرتبط."
+            " استخدم زر 🧪 من شاشة شام كاش لرؤية السجل الفعلي.",
+        )
 
     except asyncio.CancelledError:
         raise
@@ -5541,6 +5607,13 @@ async def _sham_wd_tick() -> dict:
     sess = await _sham_load()
 
     if not sess:
+        # [AUTO-FIX 5.18.18] إشعار يومي واحد بدل السكوت التام
+        await _notify_once(
+            f"wdnosess:{datetime.now(timezone.utc):%Y-%m-%d}",
+            "⚠️ <b>السحب الآلي متوقف فعلياً</b> — جلسة شام كاش غير "
+            "موجودة أو منتهية، فلا تُنفَّذ أي سحوبات آلية.\n"
+            "أعد الربط من: الإدارة ← شام كاش ← 🔁 إعادة ربط.",
+        )
         return stats
 
     min_a = await get_float_setting("shamwd_min", 1.0)
@@ -5678,7 +5751,10 @@ async def _sham_wd_tick() -> dict:
             await _sham_wd_freeze(
                 f"رفض شام كاش السحب #{req['id']}: "
                 f"{esc(str(res.get('message') or res.get('result') or '?'))}."
-                " أمر الدفع معلق — عالجه يدوياً.",
+                f"\n📄 <b>الرد الخام</b> (أرسله للأدمن التقني لتصحيح"
+                " صيغة الإرسال):\n"
+                f"<code>{esc(str(res)[:400])}</code>"
+                "\n\nأمر الدفع معلق — عالجه يدوياً.",
             )
             break
 
@@ -5705,7 +5781,10 @@ async def _sham_wd_tick() -> dict:
             await _sham_wd_freeze(
                 f"نتيجة غير مؤكدة للسحب #{req['id']} "
                 f"({amount:,.2f} ← {dest}) — لا مرجع بالإرسال ولا"
-                " بالسجل. تحقق من محفظة شام قبل أي إجراء.",
+                " بالسجل."
+                f"\n📄 <b>الرد الخام</b> (أرسله للأدمن التقني):"
+                f"\n<code>{esc(str(res)[:400])}</code>"
+                "\n\nتحقق من محفظة شام قبل أي إجراء.",
             )
             break
 
@@ -6226,6 +6305,152 @@ async def sham_balances(cb: types.CallbackQuery, state: FSMContext):
         await cb.message.edit_text(txt, reply_markup=kb.as_markup())
     except Exception:
         await cb.message.answer(txt, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "sham_diag")
+async def sham_diag_cb(cb: types.CallbackQuery, state: FSMContext):
+    """[AUTO-FIX 5.18.18] فحص تشخيصي حي لربط شام كاش.
+
+    يجيب عن أسئلة فشل الشحن/السحب الآلي فوراً:
+    1) هل الجلسة حية أصلاً؟ (profile)
+    2) هل الأرصدة تُقرأ؟
+    3) كيف يبدو السجل فعلياً؟ (عينة خام بالحقول الحقيقية —
+       strTranId/tranKind/...) لتقارنها بما يدخله المستخدمون.
+
+    ملاحظة: العينة الخام تظهر بنية ردود الخادم كما هي — وهي المفتاح
+    لتصحيح صيغة التحويل الصادر عند أول فشل سحب آلي.
+    """
+    if not await is_admin_or_supervisor(cb.from_user.id):
+        await cb.answer("غير مصرّح.", show_alert=True)
+        return
+
+    await cb.answer("🧪 جارٍ الفحص…")
+
+    if not _sham_feature_ok():
+        await cb.message.answer("❌ وحدة sham_link غير متوفرة.")
+        return
+
+    sess = await _sham_load()
+
+    if not sess:
+        await cb.message.answer(
+            "🧪 <b>تشخيص شام كاش</b>\n\n"
+            "❌ لا توجد جلسة محفوظة — الحساب غير مرتبط.\n"
+            "هذا سبب توقف الشحن/السحب الآلي إن كانا مفعّلين.\n"
+            "اربطه من «🔗 ربط حساب الآن» ثم أعد الفحص.",
+        )
+        return
+
+    lines = ["🧪 <b>تشخيص شام كاش</b>\n"]
+    alive = False
+
+    # 1) صلاحية الجلسة
+    try:
+        prof = await sham.profile(sess)
+        alive = True
+        name = ""
+
+        if isinstance(prof, dict):
+            name = str(prof.get("fullName") or prof.get("name")
+                       or prof.get("accountNumber") or "")
+
+        lines.append(
+            "1️⃣ الجلسة: ✅ حية"
+            + (f" — <code>{esc(name[:60])}</code>" if name else ""),
+        )
+    except sham.ShamError as exc:
+        lines.append(f"1️⃣ الجلسة: ❌ <code>{esc(str(exc))}</code>")
+        lines.append("→ الجلسة منتهية على الأرجح: 🔁 إعادة ربط ثم أعد الفحص.")
+
+    # 2) الأرصدة
+    if alive:
+        try:
+            bal = await sham.balances(sess)
+            lines.append("\n2️⃣ الأرصدة: ✅")
+            lines.append(sham.format_balances(bal))
+        except sham.ShamError as exc:
+            lines.append(f"\n2️⃣ الأرصدة: ❌ <code>{esc(str(exc))}</code>")
+
+        # 3) عينة خام من السجل — البنية الفعلية للحقول
+        try:
+            data = await sham.history(sess, 1)
+            rows = []
+
+            if isinstance(data, list):
+                rows = [r for r in data if isinstance(r, dict)]
+            elif isinstance(data, dict):
+                for k in ("items", "logs", "records", "data",
+                          "transactions"):
+                    v = data.get(k)
+
+                    if isinstance(v, list):
+                        rows = [r for r in v if isinstance(r, dict)]
+                        break
+
+            lines.append(f"\n3️⃣ السجل (صفحة 1): {len(rows)} حركة")
+
+            for i, tx in enumerate(rows[:3], 1):
+                raw = json.dumps(tx, ensure_ascii=False, default=str)
+                lines.append(
+                    f"\n📄 حركة {i} (خام):"
+                    f"\n<code>{esc(raw[:550])}</code>",
+                )
+
+            inc = [t for t in rows if str(t.get("tranKind") or "") == "1"]
+            outg = [t for t in rows if str(t.get("tranKind") or "") == "2"]
+
+            lines.append(
+                f"\n📊 صفحة السجل: {len(rows)} حركة"
+                f" | وارد {len(inc)} | صادر {len(outg)}",
+            )
+
+            if inc:
+                keys = ", ".join(list(inc[0].keys())[:14])
+                lines.append(
+                    "🔍 حقول أول عملية واردة:"
+                    f"\n<code>{esc(keys)}</code>",
+                )
+                lines.append(
+                    "🔢 رقمها (strTranId): <code>"
+                    + esc(str(inc[0].get("strTranId") or "غير موجود!"))
+                    + "</code> — هذا ما يجب أن يرسله المستخدم"
+                    " كرقم العملية.",
+                )
+            elif rows:
+                lines.append(
+                    "ℹ️ لا توجد عمليات واردة بهذه الصفحة — إن كان لديك"
+                    " تحويل جديد فجرّب لاحقاً أو أرسل واحداً الآن ثم"
+                    " أعد الفحص.",
+                )
+            else:
+                lines.append(
+                    "⚠️ السجل عاد فارغاً — إن كان يجب أن يحوي حركات"
+                    " فالبنية تغيرت (راسل الأدمن التقني بالرد الخام).",
+                )
+        except sham.ShamError as exc:
+            lines.append(
+                f"\n3️⃣ السجل: ❌ <code>{esc(str(exc))}</code>",
+            )
+
+    lines.append(
+        "\n💡 إن كان الشحن الآلي لا يعمل: قارن رقم العملية أعلاه مع"
+        " ما يدخله المستخدم، وتأكد أن المبلغ المطابق وصل لحساب البوت.",
+    )
+
+    txt = "\n".join(lines)
+
+    if len(txt) > 3900:
+        txt = txt[:3900] + "\n…"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 إعادة الفحص", callback_data="sham_diag")
+    kb.button(text="🔙 رجوع", callback_data="sham_home")
+    kb.adjust(2)
+
+    try:
+        await cb.message.answer(txt, reply_markup=kb.as_markup())
+    except Exception:
+        await cb.message.answer("🧪 الفحص اكتمل — لكن تعذر عرض التفاصيل.")
 
 
 @dp.callback_query(F.data == "sham_unlink")
@@ -8263,10 +8488,43 @@ async def _finalize_withdraw(message: types.Message, state: FSMContext,
                     (now_iso(), request_id),
                 )
                 await db_h.commit()
-                await message.answer(
-                    "❌ تغيّر رصيدك منذ إعداد الطلب — لم يُخصم شيء"
-                    " وأُلغي الطلب.\nأعد المحاولة من الشاشة السابقة."
-                )
+
+                # [AUTO-FIX 5.18.18] سبب واضح بدل رسالة مربكة:
+                # طلبات سحب معلقة سابقة تحتجز الرصيد هي السبب غالباً
+                pend_ids: list = []
+                db_p = await get_db()
+
+                try:
+                    cur_p = await db_p.execute(
+                        "SELECT id, amount FROM finance_requests"
+                        " WHERE telegram_id = ? AND type = 'withdraw'"
+                        " AND status IN ('pending', 'awaiting_admin')"
+                        " AND id != ?"
+                        " ORDER BY id DESC LIMIT 5",
+                        (message.from_user.id, request_id),
+                    )
+                    pend_ids = [
+                        f"#{r['id']} ({money(round2(float(r['amount'])))})"
+                        for r in await cur_p.fetchall()
+                    ]
+                except Exception:
+                    pass
+                finally:
+                    await db_p.close()
+
+                if pend_ids:
+                    await message.answer(
+                        "❌ رصيدك المتاح لا يكفي لهذا السحب.\n\n"
+                        "🔒 لديك طلبات سحب قيد المعالجة تحتجز رصيدك:\n"
+                        + "\n".join(pend_ids)
+                        + "\n\nانتظر معالجتها أو تابعها من «طلباتي»،"
+                        " ثم أعد المحاولة."
+                    )
+                else:
+                    await message.answer(
+                        "❌ تغيّر رصيدك منذ إعداد الطلب — لم يُخصم شيء"
+                        " وأُلغي الطلب.\nأعد المحاولة من الشاشة السابقة."
+                    )
                 await state.clear()
                 return
 

@@ -214,9 +214,26 @@ async def _post(path: str, body_obj: dict, token: str = None,
         ) as sess:
             async with sess.post(url, data=json.dumps(body).encode("utf-8"),
                                  headers=headers, proxy=proxy) as resp:
-                return await resp.json(content_type=None)
+                # [AUTO-FIX 5.18.18] إظهار حالة HTTP عند رد غير JSON —
+                # كان 401/400 يظهر كفشل اتصال عام بلا تفاصيل
+                try:
+                    return await resp.json(content_type=None)
+                except Exception:
+                    snippet = ""
+
+                    try:
+                        snippet = (await resp.text())[:200]
+                    except Exception:
+                        pass
+
+                    raise ShamError(
+                        f"رد غير JSON من شام كاش (HTTP {resp.status})"
+                        + (f": {snippet}" if snippet else ""),
+                    )
+    except ShamError:
+        raise
     except Exception as exc:
-        raise ShamError(f"تعذر الاتصال بشام كاش: {type(exc).__name__}") from exc
+        raise ShamError(f"تعذر الاتصال بشام كاش: {type(exc).__name__}: {exc}") from exc
 
 
 def _unwrap_enc(res: dict, inner_key: bytes):
